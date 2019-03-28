@@ -39,8 +39,6 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tf2onnx")
 
 TEMP_DIR = os.path.join(utils.get_temp_directory(), "run_pretrained")
-PERFITER = 1000
-
 
 def get_beach(shape):
     """Get beach image as input."""
@@ -76,6 +74,13 @@ _INPUT_FUNC_MAPPING = {
     "get_ramp": get_ramp
 }
 
+def get_perf_stats(times):
+    result = f"N:{len(times)} "
+    result += f"Avg:{np.average(times):.6f} "
+    result += f"50%ile:{np.percentile(times, 50):.6f} "
+    result += f"90%ile:{np.percentile(times, 90):.6f}"
+
+    return result
 
 class Test(object):
     """Main Test class."""
@@ -98,8 +103,11 @@ class Test(object):
         self.atol = atol
         self.check_only_shape = check_only_shape
         self.perf = None
+        self.perf_num_iters = 0;
         self.tf_runtime = 0
+        self.tf_runtime_stats = None
         self.onnx_runtime = 0
+        self.onnx_runtime_stats = None
         self.model_type = model_type
         self.force_input_shape = force_input_shape
         self.skip_tensorflow = skip_tensorflow
@@ -150,9 +158,14 @@ class Test(object):
         result = sess.run(self.output_names, feed_dict=feed_dict)
         if self.perf:
             start = time.time()
-            for _ in range(PERFITER):
+            run_times = []
+            for _ in range(self.perf_num_iters):
+                iter_start = time.time_ns()
                 _ = sess.run(self.output_names, feed_dict=feed_dict)
+                iter_end = time.time_ns()
+                run_times.append((iter_end - iter_start)/1000000) # convert to ms from ns
             self.tf_runtime = time.time() - start
+            self.tf_runtime_stats = get_perf_stats(run_times)
         return result
 
     def to_onnx(self, tf_graph, opset=None, shape_override=None, input_names=None):
@@ -168,7 +181,7 @@ class Test(object):
         results = prepared_backend.run(inputs)
         if self.perf:
             start = time.time()
-            for _ in range(PERFITER):
+            for _ in range(self.perf_num_iters):
                 _ = prepared_backend.run(inputs)
             self.onnx_runtime = time.time() - start
         return results
@@ -181,13 +194,13 @@ class Test(object):
         results = m.run(self.output_names, inputs)
         if self.perf:
             start = time.time()
-            for _ in range(PERFITER):
+            for _ in range(self.perf_num_iters):
                 _ = m.run(self.output_names, inputs)
             self.onnx_runtime = time.time() - start
         return results
 
     def run_onnxruntime(self, name, model_proto, inputs):
-        """Run test against msrt-next backend."""
+        """Run test against onnxruntime backend."""
         import onnxruntime as rt
         model_path = utils.save_onnx_model(TEMP_DIR, name, inputs, model_proto, include_test_data=True)
         print("\t\t" + model_path)
@@ -195,10 +208,16 @@ class Test(object):
         results = m.run(self.output_names, inputs)
         if self.perf:
             start = time.time()
-            for _ in range(PERFITER):
+            run_times = []
+            for _ in range(self.perf_num_iters):
+                iter_start = time.time_ns()
                 _ = m.run(self.output_names, inputs)
+                iter_end = time.time_ns()
+                run_times.append((iter_end - iter_start) / 1000000)  # convert to ms from ns
             self.onnx_runtime = time.time() - start
+            self.onnx_runtime_stats = get_perf_stats(run_times)
         return results
+
 
     @staticmethod
     def create_onnx_file(name, model_proto, inputs, outdir):
@@ -207,10 +226,12 @@ class Test(object):
         utils.save_protobuf(model_path, model_proto)
         print("\tcreated", model_path)
 
-    def run_test(self, name, backend="caffe2", debug=False, onnx_file=None, opset=None, perf=None, fold_const=None):
+    def run_test(self, name, backend="caffe2", debug=False, onnx_file=None, opset=None, perf=None,
+                 perf_num_iters=0, fold_const=None):
         """Run complete test against backend."""
         print(name)
         self.perf = perf
+        self.perf_num_iters = perf_num_iters
 
         # get the model
         if self.url:
@@ -327,11 +348,14 @@ def get_args():
     parser.add_argument("--backend", default="onnxruntime",
                         choices=["caffe2", "onnxmsrtnext", "onnxruntime"], help="backend to use")
     parser.add_argument("--verbose", help="verbose output", action="store_true")
-    parser.add_argument("--opset", type=int, default=None, help="opset to use")
+    parser.add_argument("--opset", type=int, default=8, help="opset to use")
     parser.add_argument("--debug", help="debug vlog", action="store_true")
     parser.add_argument("--list", help="list tests", action="store_true")
     parser.add_argument("--onnx-file", help="create onnx file in directory")
     parser.add_argument("--perf", help="capture performance numbers")
+    parser.add_argument("--perf-num-iters", type=int, default=1000,
+                        help="Number of times to execute each model if perf testing." 
+                        " If --perf is not specified this will default to 0.")
     parser.add_argument("--fold_const", help="enable tf constant_folding transformation before conversion",
                         action="store_true")
     parser.add_argument("--include-disabled", help="include disabled tests", action="store_true")
@@ -378,6 +402,10 @@ def main():
 
     failed = 0
     count = 0
+
+    if not args.perf:
+        args.perf_num_iters = 0
+
     for test in test_keys:
         t = tests[test]
         if args.tests is None and t.disabled and not args.include_disabled:
@@ -385,7 +413,9 @@ def main():
         count += 1
         try:
             ret = t.run_test(test, backend=args.backend, debug=args.debug, onnx_file=args.onnx_file,
-                             opset=args.opset, perf=args.perf, fold_const=args.fold_const)
+                             opset=args.opset, perf=args.perf, perf_num_iters=args.perf_num_iters,
+                             fold_const=args.fold_const)
+
         except Exception as ex:
             ret = None
             print(ex)
@@ -399,11 +429,12 @@ def main():
 
     if args.perf:
         with open(args.perf, "w") as f:
-            f.write("test,tensorflow,onnx\n")
+            f.write("test,tensorflow total s,onnx total s, tensorflow stats ms, onnx stats ms\n")
             for test in test_keys:
                 t = tests[test]
                 if t.perf:
-                    f.write("{},{},{}\n".format(test, t.tf_runtime, t.onnx_runtime))
+                    f.write("{},{},{},{},{}\n".format(test, t.tf_runtime, t.onnx_runtime,
+                                                      t.tf_runtime_stats, t.onnx_runtime_stats))
     return failed
 
 
